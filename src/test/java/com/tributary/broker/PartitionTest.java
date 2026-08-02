@@ -116,3 +116,4 @@ class PartitionTest {
         reopened.close();
     }
 }
+

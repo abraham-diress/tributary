@@ -44,3 +44,4 @@ public class BrokerInfo {
         return Integer.hashCode(id);
     }
 }
+

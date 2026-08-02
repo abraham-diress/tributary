@@ -58,3 +58,4 @@ class ProtocolTest {
         assertEquals("Unknown topic", result.getError());
     }
 }
+

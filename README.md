@@ -89,3 +89,4 @@ scripts/    start-zookeeper.sh, start-broker.sh, demo-failover.sh
 - When a leader fails, the controller promotes the first live replica. Replicas aren't tracked as in sync or not, so if a follower that had fallen behind is promoted, messages it was missing can be lost.
 - Consumers track their own offsets; there are no consumer groups or committed offsets.
 - There is no retention, so logs grow until deleted by hand.
+

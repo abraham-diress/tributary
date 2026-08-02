@@ -306,3 +306,4 @@ public class Partition {
         return segments.size();
     }
 }
+

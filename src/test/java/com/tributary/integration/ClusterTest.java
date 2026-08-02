@@ -175,3 +175,4 @@ class ClusterTest {
         assertTrue(client.send("after-failover", 1, "works".getBytes(StandardCharsets.UTF_8)) >= 0);
     }
 }
+

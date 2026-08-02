@@ -4,3 +4,4 @@ package com.tributary.client;
 public interface MessageHandler {
     void handle(byte[] message, long offset);
 }
+

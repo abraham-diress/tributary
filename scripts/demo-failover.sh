@@ -60,3 +60,4 @@ else
   printf '\n\033[31mFAIL: expected 20 messages, found %s.\033[0m\n' "$COUNT"
   exit 1
 fi
+

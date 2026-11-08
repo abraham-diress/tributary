@@ -3,37 +3,33 @@ package com.tributary.tools;
 import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.ZooKeeperServer;
 
-import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 
 /**
- * A single-node ZooKeeper server running in-process. Used by tests and the local cluster launcher
- * so you don't need a separate ZooKeeper install.
+ * Runs a single ZooKeeper server inside the JVM, so the cluster can be started without
+ * installing ZooKeeper separately. Also used by the integration tests.
  */
-public final class EmbeddedZooKeeper implements Closeable {
+public class EmbeddedZooKeeper {
     private final ZooKeeperServer server;
     private final ServerCnxnFactory factory;
-    private final int port;
 
     public EmbeddedZooKeeper(int port, File dataDir) throws IOException, InterruptedException {
         System.setProperty("zookeeper.admin.enableServer", "false");
-        server = new ZooKeeperServer(new File(dataDir, "snapshots"), new File(dataDir, "txnlog"), 2000);
-        factory = ServerCnxnFactory.createFactory(new InetSocketAddress("127.0.0.1", port), 1000);
+        server = new ZooKeeperServer(new File(dataDir, "snapshots"), new File(dataDir, "logs"), 2000);
+        factory = ServerCnxnFactory.createFactory(new InetSocketAddress("127.0.0.1", port), 100);
         factory.startup(server);
-        this.port = factory.getLocalPort();
     }
 
-    public int port() {
-        return port;
+    public int getPort() {
+        return factory.getLocalPort();
     }
 
-    public String connectString() {
-        return "127.0.0.1:" + port;
+    public String getConnectString() {
+        return "127.0.0.1:" + getPort();
     }
 
-    @Override
     public void close() {
         factory.shutdown();
         server.shutdown();
@@ -44,7 +40,7 @@ public final class EmbeddedZooKeeper implements Closeable {
         File dir = new File(args.length > 1 ? args[1] : "data/zookeeper");
         EmbeddedZooKeeper zk = new EmbeddedZooKeeper(port, dir);
         Runtime.getRuntime().addShutdownHook(new Thread(zk::close));
-        System.out.println("ZooKeeper listening on " + zk.connectString() + " (data: " + dir.getAbsolutePath() + ")");
+        System.out.println("ZooKeeper running on " + zk.getConnectString());
         Thread.currentThread().join();
     }
 }

@@ -1,668 +1,650 @@
 package com.tributary.broker;
 
-import com.tributary.common.BrokerInfo;
-import com.tributary.common.Errors;
-import com.tributary.common.KafkaException;
-import com.tributary.common.OffsetOutOfRangeException;
-import com.tributary.common.Protocol;
-import com.tributary.common.TopicPartition;
-import com.tributary.storage.CorruptRecordException;
-import com.tributary.storage.Log;
-import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.WatchedEvent;
-import org.apache.zookeeper.Watcher;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketException;
-import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * A Tributary broker. It serves client requests over the binary {@link Protocol}, stores the
- * partitions it hosts in local {@link Log}s, replicates follower partitions from their leaders, and
- * coordinates with other brokers through ZooKeeper:
- *
- * <pre>
- *   /brokers/ids/&lt;id&gt;                    ephemeral  broker registration (liveness)
- *   /controller                           ephemeral  id of the elected controller
- *   /topics/&lt;t&gt;                          persistent topic config
- *   /topics/&lt;t&gt;/partitions/&lt;p&gt;/state    persistent leader, leader epoch, replicas, ISR
- *   /consumers/&lt;g&gt;/offsets/&lt;t&gt;/&lt;p&gt;     persistent committed consumer offsets
- * </pre>
- *
- * ZooKeeper notifications are handled on a single "metadata" thread so state transitions for a
- * partition (leader/follower changes, truncation) never race with each other.
+ * A Tributary broker. It stores partitions on disk, serves produce and fetch requests,
+ * replicates messages to follower brokers, and coordinates with the rest of the cluster
+ * through ZooKeeper. One broker is elected controller: it creates topics and picks new
+ * partition leaders when a broker goes down.
  */
 public class TributaryBroker {
-    private static final Logger LOG = LoggerFactory.getLogger(TributaryBroker.class);
-    private static final Pattern STATE_PATH = Pattern.compile("^/topics/([^/]+)/partitions/(\\d+)/state$");
-    private static final Pattern GROUP_NAME = Pattern.compile("[a-zA-Z0-9._-]{1,200}");
+    private static final Logger LOGGER = Logger.getLogger(TributaryBroker.class.getName());
+    private static final String DATA_DIR = "data";
+    private static final int MAX_FETCH_BYTES = 1024 * 1024;
+    private static final Pattern LEADER = Pattern.compile("\"leader\":(-?\\d+)");
+    private static final Pattern REPLICAS = Pattern.compile("\"replicas\":\\[([^\\]]*)\\]");
+    private static final Pattern PARTITIONS = Pattern.compile("\"partitions\":(\\d+)");
+    private static final Pattern HOST = Pattern.compile("\"host\":\"([^\"]+)\"");
+    private static final Pattern PORT = Pattern.compile("\"port\":(\\d+)");
 
-    private final BrokerConfig config;
     private final int brokerId;
+    private final String brokerHost;
+    private int brokerPort;
+    private final String dataDir;
     private final ZookeeperClient zkClient;
-    private final Controller controller;
 
-    /** Partitions with a replica on this broker. */
-    private final Map<TopicPartition, Partition> partitions = new ConcurrentHashMap<>();
-    /** Cluster-wide partition state for every topic, mirrored from ZooKeeper. Served as metadata. */
-    private final Map<String, Map<Integer, PartitionState>> clusterMetadata = new ConcurrentHashMap<>();
-    private final Map<Integer, BrokerInfo> liveBrokers = new ConcurrentHashMap<>();
-    private final Map<TopicPartition, ReplicaFetcher> fetchers = new ConcurrentHashMap<>();
-    private volatile int controllerId = -1;
+    /** Partitions this broker stores (it is the leader or a follower). */
+    private final Map<String, Map<Integer, Partition>> topics = new ConcurrentHashMap<>();
+    /** Leader and replicas of every partition in the cluster, used to route requests. */
+    private final Map<String, Map<Integer, Protocol.PartitionMetadata>> topicMetadata = new ConcurrentHashMap<>();
+    /** Live brokers. */
+    private final Map<Integer, BrokerInfo> clusterMetadata = new ConcurrentHashMap<>();
 
-    private final ExecutorService metadataExecutor = Executors.newSingleThreadExecutor(named("metadata-events"));
-    private final ExecutorService requestPool = Executors.newCachedThreadPool(named("request-handler"));
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(named("scheduler"));
-    private final Set<Socket> openConnections = ConcurrentHashMap.newKeySet();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
-    private final CountDownLatch shutdownLatch = new CountDownLatch(1);
-    private ServerSocket serverSocket;
-    private int boundPort;
+    private final AtomicBoolean isController = new AtomicBoolean(false);
+    private ServerSocketChannel serverChannel;
 
     public TributaryBroker(int brokerId, String host, int port, int zkPort) {
-        this(new BrokerConfig(brokerId, host, port, "localhost:" + zkPort, "data"));
+        this(brokerId, host, port, "localhost:" + zkPort, DATA_DIR);
     }
 
-    public TributaryBroker(BrokerConfig config) {
-        this.config = config;
-        this.brokerId = config.brokerId;
-        this.zkClient = new ZookeeperClient(config.zkConnect, config.zkSessionTimeoutMs);
-        this.controller = new Controller(brokerId, zkClient, () -> new HashSet<>(liveBrokers.keySet()));
+    public TributaryBroker(int brokerId, String host, int port, String zkConnect, String dataDir) {
+        this.brokerId = brokerId;
+        this.brokerHost = host;
+        this.brokerPort = port;
+        this.dataDir = dataDir + File.separator + brokerId;
+        this.zkClient = new ZookeeperClient(zkConnect);
     }
 
-    // ================================================================== lifecycle
+    // ================================================================ start / stop
 
-    public void start() throws IOException, InterruptedException {
-        if (!isRunning.compareAndSet(false, true)) {
-            return;
-        }
-        File dataDir = brokerDataDir();
-        if (!dataDir.exists() && !dataDir.mkdirs()) {
-            throw new IOException("Cannot create data directory " + dataDir);
-        }
+    public void start() throws IOException {
+        serverChannel = ServerSocketChannel.open();
+        serverChannel.bind(new InetSocketAddress(brokerPort));
+        brokerPort = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
+        isRunning.set(true);
 
-        serverSocket = new ServerSocket();
-        serverSocket.setReuseAddress(true);
-        serverSocket.bind(new InetSocketAddress(config.port));
-        boundPort = serverSocket.getLocalPort();
+        registerWithZookeeper();
+        loadExistingTopics();
+        electController();
 
-        zkClient.connect();
-        zkClient.onSessionReestablished(() -> submit(this::onSessionReestablished));
-        try {
-            // Register watches before the initial reads so no change can slip between them.
-            zkClient.addPersistentWatch("/brokers/ids", false, e -> {
-                if (e.getType() == Watcher.Event.EventType.NodeChildrenChanged) submit(this::refreshLiveBrokers);
-            });
-            zkClient.addPersistentWatch("/controller", false, e -> submit(this::onControllerChange));
-            zkClient.addPersistentWatch("/topics", true, this::onTopicsEvent);
-            registerWithZookeeper();
-        } catch (KeeperException e) {
-            throw new IOException("ZooKeeper error during startup", e);
-        }
-        runOnMetadataThread(() -> {
-            refreshLiveBrokers();
-            loadAllTopics();
-            onControllerChange();
-        });
-
-        Thread acceptor = new Thread(this::acceptConnections, "acceptor-" + brokerId);
+        Thread acceptor = new Thread(this::acceptConnections, "broker-" + brokerId + "-acceptor");
         acceptor.start();
-
-        scheduler.scheduleWithFixedDelay(this::shrinkIsrs, config.replicaLagMaxMs / 2, config.replicaLagMaxMs / 2, TimeUnit.MILLISECONDS);
-        scheduler.scheduleWithFixedDelay(this::flushAndCheckpoint, config.flushIntervalMs, config.flushIntervalMs, TimeUnit.MILLISECONDS);
-        scheduler.scheduleWithFixedDelay(this::applyRetention, config.retentionCheckIntervalMs, config.retentionCheckIntervalMs, TimeUnit.MILLISECONDS);
-
-        LOG.info("Broker {} started on {}:{} (data: {})", brokerId, config.host, boundPort, dataDir.getAbsolutePath());
+        LOGGER.info("Broker " + brokerId + " started on " + brokerHost + ":" + brokerPort);
     }
 
     public void stop() {
         if (!isRunning.compareAndSet(true, false)) {
             return;
         }
-        LOG.info("Broker {} shutting down", brokerId);
-        closeQuietly(serverSocket);
-        for (Socket s : openConnections) {
-            closeQuietly(s);
-        }
-        partitions.values().forEach(Partition::wakeWaiters);
-        fetchers.values().forEach(ReplicaFetcher::shutdown);
-        fetchers.clear();
-        // shutdown() rather than shutdownNow(): interrupting a thread mid FileChannel write closes the channel.
-        scheduler.shutdown();
-        requestPool.shutdown();
-        metadataExecutor.shutdown();
-        awaitQuietly(scheduler);
-        awaitQuietly(requestPool);
-        awaitQuietly(metadataExecutor);
-        for (Partition p : partitions.values()) {
-            p.checkpointHighWatermark();
-            try {
-                p.log().close();
-            } catch (IOException e) {
-                LOG.warn("Error closing log for {}", p.topicPartition(), e);
-            }
-        }
-        controller.deactivate();
-        zkClient.close();
-        shutdownLatch.countDown();
-        LOG.info("Broker {} stopped", brokerId);
-    }
-
-    public void awaitShutdown() throws InterruptedException {
-        shutdownLatch.await();
-    }
-
-    // ================================================================== ZooKeeper / cluster state
-
-    private void registerWithZookeeper() throws KeeperException, InterruptedException, IOException {
-        String path = "/brokers/ids/" + brokerId;
-        String data = new BrokerInfo(brokerId, config.host, boundPort).toJson();
-        // A crashed previous incarnation's ephemeral node lingers until its session times out.
-        long deadline = System.currentTimeMillis() + config.zkSessionTimeoutMs * 2L;
-        while (!zkClient.createEphemeralNode(path, data)) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new IOException("Broker id " + brokerId + " is already registered in ZooKeeper");
-            }
-            LOG.info("Waiting for stale registration of broker {} to expire", brokerId);
-            Thread.sleep(500);
-        }
-        liveBrokers.put(brokerId, new BrokerInfo(brokerId, config.host, boundPort));
-        LOG.info("Registered broker {} in ZooKeeper", brokerId);
-    }
-
-    private void onSessionReestablished() throws Exception {
-        registerWithZookeeper();
-        refreshLiveBrokers();
-        loadAllTopics();
-        onControllerChange();
-    }
-
-    private void refreshLiveBrokers() throws KeeperException, InterruptedException {
-        Map<Integer, BrokerInfo> current = new HashMap<>();
-        for (String child : zkClient.getChildren("/brokers/ids")) {
-            String data = zkClient.getData("/brokers/ids/" + child);
-            if (data != null) {
-                int id = Integer.parseInt(child);
-                current.put(id, BrokerInfo.fromJson(id, data));
-            }
-        }
-        liveBrokers.keySet().retainAll(current.keySet());
-        liveBrokers.putAll(current);
-        controller.onBrokersChanged(new HashSet<>(current.keySet()));
-    }
-
-    /** Controller election: whoever creates the ephemeral /controller node first wins. */
-    private void onControllerChange() throws KeeperException, InterruptedException {
-        String data = zkClient.getData("/controller");
-        if (data == null && zkClient.createEphemeralNode("/controller", String.valueOf(brokerId))) {
-            data = String.valueOf(brokerId);
-        }
-        if (data == null) {
-            data = zkClient.getData("/controller");
-        }
-        int newController = data == null || data.isBlank() ? -1 : Integer.parseInt(data.trim());
-        controllerId = newController;
-        if (newController == brokerId) {
-            if (!controller.isActive()) {
-                controller.activate();
-            }
-        } else {
-            controller.deactivate();
-        }
-    }
-
-    private void onTopicsEvent(WatchedEvent event) {
-        if (event.getPath() == null) {
-            return;
-        }
-        Matcher m = STATE_PATH.matcher(event.getPath());
-        if (m.matches() && (event.getType() == Watcher.Event.EventType.NodeCreated
-                || event.getType() == Watcher.Event.EventType.NodeDataChanged)) {
-            String topic = m.group(1);
-            int partition = Integer.parseInt(m.group(2));
-            submit(() -> refreshPartitionState(topic, partition));
-        }
-    }
-
-    private void loadAllTopics() throws Exception {
-        for (String topic : zkClient.getChildren("/topics")) {
-            for (String p : zkClient.getChildren("/topics/" + topic + "/partitions")) {
-                refreshPartitionState(topic, Integer.parseInt(p));
-            }
-        }
-    }
-
-    private void refreshPartitionState(String topic, int partitionId) throws Exception {
-        String data = zkClient.getData(statePath(topic, partitionId));
-        if (data == null || data.isEmpty()) {
-            return;
-        }
-        PartitionState state = PartitionState.fromJson(data);
-        clusterMetadata.computeIfAbsent(topic, t -> new ConcurrentHashMap<>()).put(partitionId, state);
-        if (state.replicas().contains(brokerId)) {
-            applyPartitionState(getOrCreatePartition(new TopicPartition(topic, partitionId)), state);
-        }
-    }
-
-    /** Makes this replica a leader or follower according to the latest state from ZooKeeper. */
-    private void applyPartitionState(Partition partition, PartitionState state) throws IOException {
-        TopicPartition tp = partition.topicPartition();
-        if (state.leaderEpoch() < partition.leaderEpoch()) {
-            return; // stale notification
-        }
-        boolean sameEpoch = state.leaderEpoch() == partition.leaderEpoch();
-        if (state.leader() == brokerId) {
-            if (sameEpoch && partition.isLeader()) {
-                partition.updateState(state);
-                return;
-            }
-            stopFetcher(tp);
-            partition.makeLeader(state);
-        } else {
-            ReplicaFetcher fetcher = fetchers.get(tp);
-            boolean upToDate = sameEpoch && !partition.isLeader()
-                    && (state.leader() < 0 || (fetcher != null && fetcher.leaderId() == state.leader()));
-            if (upToDate) {
-                partition.updateState(state);
-                return;
-            }
-            stopFetcher(tp);
-            partition.makeFollower(state);
-            if (state.leader() >= 0) {
-                ReplicaFetcher f = new ReplicaFetcher(partition, state.leader(), state.leaderEpoch(), liveBrokers::get, config);
-                fetchers.put(tp, f);
-                f.start();
-            }
-        }
-    }
-
-    private void stopFetcher(TopicPartition tp) {
-        ReplicaFetcher f = fetchers.remove(tp);
-        if (f != null) {
-            f.shutdown();
-        }
-    }
-
-    private Partition getOrCreatePartition(TopicPartition tp) {
-        return partitions.computeIfAbsent(tp, key -> {
-            try {
-                File dir = new File(new File(brokerDataDir(), key.topic()), String.valueOf(key.partition()));
-                return new Partition(key, brokerId, new Log(dir, config.logConfig), this::updateIsr);
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to open log for " + key, e);
-            }
-        });
-    }
-
-    /** Leader-side ISR change, written to ZooKeeper with compare-and-set. */
-    private boolean updateIsr(Partition partition, int leaderEpoch, Set<Integer> newIsr) {
-        TopicPartition tp = partition.topicPartition();
-        String path = statePath(tp.topic(), tp.partition());
         try {
-            for (int attempt = 0; attempt < 5; attempt++) {
-                ZookeeperClient.VersionedData current = zkClient.getDataWithVersion(path);
-                if (current == null) {
-                    return false;
-                }
-                PartitionState state = PartitionState.fromJson(current.data());
-                if (state.leader() != brokerId || state.leaderEpoch() != leaderEpoch) {
-                    return false; // leadership moved on; the controller's view wins
-                }
-                List<Integer> ordered = state.replicas().stream().filter(newIsr::contains).toList();
-                if (zkClient.setData(path, state.withIsr(ordered).toJson(), current.version())) {
-                    partition.applyIsr(leaderEpoch, newIsr);
-                    return true;
-                }
-            }
-        } catch (KeeperException | RuntimeException e) {
-            LOG.warn("{}: failed to update ISR", tp, e);
+            serverChannel.close();
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Error closing server socket", e);
+        }
+        executor.shutdown();
+        try {
+            executor.awaitTermination(3, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        return false;
+        for (Map<Integer, Partition> partitions : topics.values()) {
+            for (Partition partition : partitions.values()) {
+                try {
+                    partition.close();
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Error closing partition", e);
+                }
+            }
+        }
+        zkClient.close();
+        LOGGER.info("Broker " + brokerId + " stopped");
     }
 
-    // ================================================================== background tasks
+    // ================================================================ ZooKeeper
 
-    private void shrinkIsrs() {
-        long now = System.currentTimeMillis();
-        for (Partition p : partitions.values()) {
-            Set<Integer> lagging = p.laggingReplicas(now, config.replicaLagMaxMs);
-            if (!lagging.isEmpty()) {
-                Set<Integer> newIsr = new HashSet<>(p.inSyncReplicas());
-                newIsr.removeAll(lagging);
-                if (updateIsr(p, p.leaderEpoch(), newIsr)) {
-                    LOG.info("{}: shrank ISR to {} (lagging: {})", p.topicPartition(), newIsr, lagging);
+    private void registerWithZookeeper() throws IOException {
+        try {
+            zkClient.connect();
+            String path = "/brokers/ids/" + brokerId;
+            String data = "{\"host\":\"" + brokerHost + "\",\"port\":" + brokerPort + "}";
+            // After a crash, the old registration stays until its ZooKeeper session times out
+            long deadline = System.currentTimeMillis() + 20_000;
+            while (!zkClient.createEphemeralNode(path, data)) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new IOException("Broker id " + brokerId + " is already registered");
+                }
+                Thread.sleep(500);
+            }
+            clusterMetadata.put(brokerId, new BrokerInfo(brokerId, brokerHost, brokerPort));
+            zkClient.watchChildren("/brokers/ids", this::onBrokersChanged);
+            LOGGER.info("Broker " + brokerId + " registered with ZooKeeper");
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Failed to register with ZooKeeper", e);
+        }
+    }
+
+    /** Called whenever a broker joins or leaves the cluster. */
+    private synchronized void onBrokersChanged(List<String> brokerIds) {
+        Set<Integer> live = new HashSet<>();
+        for (String id : brokerIds) {
+            int brokerId = Integer.parseInt(id);
+            live.add(brokerId);
+            if (!clusterMetadata.containsKey(brokerId)) {
+                try {
+                    String data = zkClient.getData("/brokers/ids/" + id);
+                    if (data != null) {
+                        clusterMetadata.put(brokerId, parseBrokerInfo(brokerId, data));
+                    }
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Could not read broker " + id, e);
+                }
+            }
+        }
+        clusterMetadata.keySet().retainAll(live);
+        LOGGER.info("Broker " + brokerId + " sees live brokers " + live);
+
+        if (isController.get()) {
+            rebalancePartitions();
+        }
+    }
+
+    /** The first broker to create the ephemeral /controller node becomes the controller. */
+    private void electController() {
+        try {
+            if (zkClient.createEphemeralNode("/controller", String.valueOf(brokerId))) {
+                isController.set(true);
+                LOGGER.info("Broker " + brokerId + " is now the controller");
+                rebalancePartitions();
+            } else {
+                isController.set(false);
+            }
+            zkClient.watchNode("/controller", this::onControllerChange);
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Controller election failed, retrying", e);
+            new Thread(() -> {
+                try {
+                    Thread.sleep(2000);
+                    if (isRunning.get()) {
+                        electController();
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }).start();
+        }
+    }
+
+    private void onControllerChange() {
+        if (isRunning.get()) {
+            electController();
+        }
+    }
+
+    private int getControllerId() throws Exception {
+        String data = zkClient.getData("/controller");
+        return data == null || data.isEmpty() ? -1 : Integer.parseInt(data.trim());
+    }
+
+    // ================================================================ topics
+
+    private void loadExistingTopics() throws IOException {
+        try {
+            for (String topic : zkClient.getChildren("/topics")) {
+                loadTopic(topic);
+            }
+        } catch (Exception e) {
+            throw new IOException("Failed to load topics", e);
+        }
+    }
+
+    /** Reads a topic's partition assignments from ZooKeeper and opens the partitions stored here. */
+    private synchronized void loadTopic(String topic) throws Exception {
+        String config = zkClient.getData("/topics/" + topic);
+        if (config == null) {
+            return;
+        }
+        Matcher m = PARTITIONS.matcher(config);
+        if (!m.find()) {
+            return;
+        }
+        int numPartitions = Integer.parseInt(m.group(1));
+
+        Map<Integer, Protocol.PartitionMetadata> metadata = topicMetadata.computeIfAbsent(topic, t -> new ConcurrentHashMap<>());
+        for (int p = 0; p < numPartitions; p++) {
+            String state = zkClient.getData(statePath(topic, p));
+            if (state == null) {
+                continue;
+            }
+            int leader = parseLeader(state);
+            List<Integer> replicas = parseReplicas(state);
+            metadata.put(p, new Protocol.PartitionMetadata(p, leader, replicas));
+
+            if (replicas.contains(brokerId)) {
+                List<Integer> followers = new ArrayList<>(replicas);
+                followers.remove(Integer.valueOf(leader));
+                Map<Integer, Partition> partitions = topics.computeIfAbsent(topic, t -> new ConcurrentHashMap<>());
+                Partition partition = partitions.get(p);
+                if (partition == null) {
+                    String dir = dataDir + File.separator + topic + File.separator + p;
+                    partitions.put(p, new Partition(p, leader, followers, dir));
+                } else {
+                    partition.setLeader(leader);
+                    partition.setFollowers(followers);
                 }
             }
         }
     }
 
-    private void flushAndCheckpoint() {
-        for (Partition p : partitions.values()) {
-            try {
-                p.log().flush();
-            } catch (IOException e) {
-                LOG.warn("Failed to flush {}", p.topicPartition(), e);
+    /** Controller only: assigns replicas round-robin across live brokers and saves them in ZooKeeper. */
+    private void createTopic(String topic, int numPartitions, short replicationFactor) throws Exception {
+        if (zkClient.exists("/topics/" + topic)) {
+            throw new IllegalArgumentException("Topic " + topic + " already exists");
+        }
+        List<Integer> brokers = new ArrayList<>(clusterMetadata.keySet());
+        Collections.sort(brokers);
+        if (replicationFactor < 1 || replicationFactor > brokers.size()) {
+            throw new IllegalArgumentException("Replication factor " + replicationFactor
+                    + " must be between 1 and the number of live brokers (" + brokers.size() + ")");
+        }
+
+        for (int p = 0; p < numPartitions; p++) {
+            List<Integer> replicas = new ArrayList<>();
+            for (int i = 0; i < replicationFactor; i++) {
+                replicas.add(brokers.get((p + i) % brokers.size()));
             }
-            p.checkpointHighWatermark();
+            zkClient.createPersistentNode(statePath(topic, p), stateJson(replicas.get(0), replicas));
+        }
+        zkClient.createPersistentNode("/topics/" + topic,
+                "{\"partitions\":" + numPartitions + ",\"replication_factor\":" + replicationFactor + "}");
+
+        loadTopic(topic);
+        notifyBrokers(topic);
+        LOGGER.info("Created topic " + topic + " with " + numPartitions + " partitions, replication factor " + replicationFactor);
+    }
+
+    /**
+     * Controller only: gives every partition whose leader is down a new leader, chosen from its
+     * live replicas, then tells the other brokers to reload the topic.
+     */
+    private synchronized void rebalancePartitions() {
+        if (!isController.get()) {
+            return;
+        }
+        try {
+            Set<Integer> live = new HashSet<>(clusterMetadata.keySet());
+            for (String topic : zkClient.getChildren("/topics")) {
+                boolean changed = false;
+                for (String p : zkClient.getChildren("/topics/" + topic + "/partitions")) {
+                    int partition = Integer.parseInt(p);
+                    String state = zkClient.getData(statePath(topic, partition));
+                    if (state == null) {
+                        continue;
+                    }
+                    int leader = parseLeader(state);
+                    if (live.contains(leader)) {
+                        continue;
+                    }
+                    List<Integer> replicas = parseReplicas(state);
+                    int newLeader = -1;
+                    for (int replica : replicas) {
+                        if (live.contains(replica)) {
+                            newLeader = replica;
+                            break;
+                        }
+                    }
+                    if (newLeader != leader) {
+                        zkClient.createPersistentNode(statePath(topic, partition), stateJson(newLeader, replicas));
+                        LOGGER.info("Partition " + topic + "-" + partition + " leader changed from " + leader + " to " + newLeader);
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    loadTopic(topic);
+                    notifyBrokers(topic);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to rebalance partitions", e);
         }
     }
 
-    private void applyRetention() {
-        for (Partition p : partitions.values()) {
+    /** Tells every other live broker to reload a topic from ZooKeeper. */
+    private void notifyBrokers(String topic) {
+        for (BrokerInfo broker : clusterMetadata.values()) {
+            if (broker.getId() == brokerId) {
+                continue;
+            }
             try {
-                p.log().deleteOldSegments();
+                sendRequest(broker, Protocol.encodeTopicNotification(topic));
             } catch (IOException e) {
-                LOG.warn("Retention failed for {}", p.topicPartition(), e);
+                LOGGER.warning("Could not notify broker " + broker.getId() + " about topic " + topic);
             }
         }
     }
 
-    // ================================================================== networking
+    // ================================================================ networking
 
     private void acceptConnections() {
         while (isRunning.get()) {
             try {
-                Socket socket = serverSocket.accept();
-                socket.setTcpNoDelay(true);
-                openConnections.add(socket);
-                requestPool.submit(() -> handleClient(socket));
-            } catch (SocketException e) {
-                if (isRunning.get()) {
-                    LOG.error("Error accepting connection", e);
-                }
+                SocketChannel clientChannel = serverChannel.accept();
+                executor.submit(() -> handleClient(clientChannel));
             } catch (Exception e) {
                 if (isRunning.get()) {
-                    LOG.error("Error accepting connection", e);
+                    LOGGER.log(Level.SEVERE, "Error accepting connection", e);
                 }
             }
         }
     }
 
-    /** One thread per connection; requests on a connection are processed in order. */
-    private void handleClient(Socket socket) {
-        try (socket;
-             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 64 * 1024));
-             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 64 * 1024))) {
+    /** Each connection gets its own thread, which handles its requests one at a time. */
+    private void handleClient(SocketChannel clientChannel) {
+        try (clientChannel) {
             while (isRunning.get()) {
-                ByteBuffer request;
-                try {
-                    request = Protocol.readFrame(in);
-                } catch (EOFException e) {
-                    return; // client closed the connection
-                }
-                Protocol.writeFrame(out, processClientMessage(request));
+                ByteBuffer request = Protocol.receive(clientChannel);
+                processClientMessage(clientChannel, request);
             }
         } catch (IOException e) {
-            if (isRunning.get()) {
-                LOG.debug("Connection closed: {}", e.getMessage());
-            }
-        } finally {
-            openConnections.remove(socket);
+            // client disconnected
         }
     }
 
-    ByteBuffer processClientMessage(ByteBuffer buffer) {
-        byte type = buffer.get();
+    private void processClientMessage(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
+        byte messageType = buffer.get();
         try {
-            return switch (type) {
-                case Protocol.PRODUCE -> handleProduceRequest(Protocol.decodeProduceRequest(buffer));
-                case Protocol.FETCH -> handleFetchRequest(Protocol.decodeFetchRequest(buffer));
-                case Protocol.METADATA -> handleMetadataRequest();
-                case Protocol.CREATE_TOPIC -> handleCreateTopicRequest(Protocol.decodeCreateTopicRequest(buffer));
-                case Protocol.OFFSET_COMMIT -> handleOffsetCommitRequest(Protocol.decodeOffsetCommitRequest(buffer));
-                case Protocol.OFFSET_FETCH -> handleOffsetFetchRequest(Protocol.decodeOffsetFetchRequest(buffer));
-                default -> Protocol.errorResponse(type, Errors.INVALID_REQUEST, "Unknown request type " + type);
-            };
-        } catch (KafkaException e) {
-            return Protocol.errorResponse(type, e.code(), e.detail());
-        } catch (CorruptRecordException e) {
-            return Protocol.errorResponse(type, Errors.CORRUPT_MESSAGE, e.getMessage());
-        } catch (BufferUnderflowException | IllegalArgumentException e) {
-            return Protocol.errorResponse(type, Errors.INVALID_REQUEST, "Malformed request: " + e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return Protocol.errorResponse(type, Errors.UNKNOWN_SERVER_ERROR, "Interrupted");
+            switch (messageType) {
+                case Protocol.PRODUCE:
+                    handleProduceRequest(clientChannel, buffer);
+                    break;
+                case Protocol.FETCH:
+                    handleFetchRequest(clientChannel, buffer);
+                    break;
+                case Protocol.METADATA:
+                    handleMetadataRequest(clientChannel);
+                    break;
+                case Protocol.CREATE_TOPIC:
+                    handleCreateTopicRequest(clientChannel, buffer);
+                    break;
+                case Protocol.REPLICATE:
+                    handleReplicateRequest(clientChannel, buffer);
+                    break;
+                case Protocol.TOPIC_NOTIFICATION:
+                    handleTopicNotification(clientChannel, buffer);
+                    break;
+                default:
+                    Protocol.sendErrorResponse(clientChannel, "Unknown message type: " + messageType);
+            }
+        } catch (IOException e) {
+            throw e;
         } catch (Exception e) {
-            LOG.error("Error handling request type {}", type, e);
-            return Protocol.errorResponse(type, Errors.UNKNOWN_SERVER_ERROR, e.toString());
+            Protocol.sendErrorResponse(clientChannel, e.getMessage() == null ? e.toString() : e.getMessage());
         }
     }
 
-    // ================================================================== request handlers
-
-    private ByteBuffer handleProduceRequest(Protocol.ProduceRequest req) throws IOException, InterruptedException {
-        if (req.records().isEmpty()) {
-            throw new KafkaException(Errors.INVALID_REQUEST, "Produce request has no records");
+    /** Opens a connection to another broker, sends one request and returns the response. */
+    private ByteBuffer sendRequest(BrokerInfo broker, ByteBuffer request) throws IOException {
+        try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(broker.getHost(), broker.getPort()))) {
+            Protocol.send(channel, request);
+            return Protocol.receive(channel);
         }
-        Partition partition = leaderPartition(req.topic(), req.partition());
-        if (req.acks() == Protocol.ACKS_ALL && partition.inSyncReplicas().size() < config.minInsyncReplicas) {
-            throw new KafkaException(Errors.NOT_ENOUGH_REPLICAS, "ISR " + partition.inSyncReplicas()
-                    + " is smaller than min.insync.replicas=" + config.minInsyncReplicas);
-        }
-        long baseOffset = partition.appendAsLeader(req.records());
-        long lastOffset = baseOffset + req.records().size() - 1;
-        if (req.acks() == Protocol.ACKS_ALL && !partition.awaitHighWatermark(lastOffset + 1, req.timeoutMs())) {
-            throw new KafkaException(Errors.REQUEST_TIMED_OUT, "Timed out waiting for offset " + lastOffset
-                    + " to be replicated to the ISR " + partition.inSyncReplicas());
-        }
-        return Protocol.encodeProduceResponse(baseOffset);
     }
 
-    private ByteBuffer handleFetchRequest(Protocol.FetchRequest req) throws IOException, InterruptedException {
-        Partition partition = leaderPartition(req.topic(), req.partition());
-        int maxWait = Math.max(0, Math.min(req.maxWaitMs(), 30_000));
-        try {
-            Partition.FetchData data;
-            if (req.replicaId() >= 0) {
-                if (req.leaderEpoch() != partition.leaderEpoch()) {
-                    throw new KafkaException(Errors.FENCED_LEADER_EPOCH, "Fetch epoch " + req.leaderEpoch()
-                            + " does not match leader epoch " + partition.leaderEpoch());
-                }
-                data = partition.readForFollower(req.replicaId(), req.offset(), req.maxBytes(), maxWait);
-            } else {
-                data = partition.readForConsumer(req.offset(), req.maxBytes(), maxWait);
+    // ================================================================ request handlers
+
+    private void handleProduceRequest(SocketChannel clientChannel, ByteBuffer buffer) throws Exception {
+        String topic = Protocol.getString(buffer);
+        int partitionId = buffer.getInt();
+        byte[] message = new byte[buffer.getInt()];
+        buffer.get(message);
+
+        Protocol.PartitionMetadata metadata = getPartitionMetadata(topic, partitionId);
+        if (metadata.getLeader() != brokerId) {
+            // Forward to the leader
+            BrokerInfo leader = clusterMetadata.get(metadata.getLeader());
+            if (leader == null) {
+                throw new IllegalStateException("No leader available for " + topic + "-" + partitionId);
             }
-            return Protocol.encodeFetchResponse(Errors.NONE, null, data.highWatermark(), data.logStartOffset(),
-                    data.logEndOffset(), data.records());
-        } catch (OffsetOutOfRangeException e) {
-            return Protocol.encodeFetchResponse(Errors.OFFSET_OUT_OF_RANGE, e.detail(), partition.highWatermark(),
-                    e.logStartOffset(), e.logEndOffset(), ByteBuffer.allocate(0));
+            Protocol.send(clientChannel, sendRequest(leader, Protocol.encodeProduceRequest(topic, partitionId, message)));
+            return;
         }
+
+        Partition partition = topics.get(topic).get(partitionId);
+        long offset = partition.append(message);
+        replicateToFollowers(topic, partition, message, offset);
+        Protocol.send(clientChannel, Protocol.encodeProduceResponse(offset));
     }
 
-    private ByteBuffer handleMetadataRequest() {
-        List<Protocol.TopicMetadata> topics = new ArrayList<>();
-        for (Map.Entry<String, Map<Integer, PartitionState>> topic : clusterMetadata.entrySet()) {
-            List<Protocol.PartitionMetadata> parts = new ArrayList<>();
-            for (Map.Entry<Integer, PartitionState> p : topic.getValue().entrySet()) {
-                PartitionState s = p.getValue();
-                parts.add(new Protocol.PartitionMetadata(p.getKey(), s.leader(), s.leaderEpoch(), s.replicas(), s.isr()));
+    /**
+     * Sends the message to every live follower in parallel and waits for their acknowledgements
+     * before the producer is answered. A follower that missed earlier messages (for example,
+     * because it was restarted) is sent those first.
+     */
+    private void replicateToFollowers(String topic, Partition partition, byte[] message, long offset) {
+        List<Future<?>> pending = new ArrayList<>();
+        for (int followerId : partition.getFollowers()) {
+            BrokerInfo follower = clusterMetadata.get(followerId);
+            if (follower == null) {
+                continue;
             }
-            parts.sort(Comparator.comparingInt(Protocol.PartitionMetadata::id));
-            topics.add(new Protocol.TopicMetadata(topic.getKey(), parts));
-        }
-        topics.sort(Comparator.comparing(Protocol.TopicMetadata::name));
-        List<BrokerInfo> brokers = new ArrayList<>(liveBrokers.values());
-        brokers.sort(Comparator.comparingInt(BrokerInfo::getId));
-        return Protocol.encodeMetadataResponse(controllerId, brokers, topics);
-    }
-
-    private ByteBuffer handleCreateTopicRequest(Protocol.CreateTopicRequest req) throws KafkaException {
-        if (!controller.isActive()) {
-            throw new KafkaException(Errors.NOT_CONTROLLER, "The controller is broker " + controllerId);
-        }
-        controller.createTopic(req.topic(), req.numPartitions(), req.replicationFactor());
-        return Protocol.emptyResponse(Protocol.CREATE_TOPIC);
-    }
-
-    private ByteBuffer handleOffsetCommitRequest(Protocol.OffsetCommitRequest req) throws Exception {
-        String path = offsetPath(req.group(), req.topic(), req.partition());
-        zkClient.createPersistentNode(path, Long.toString(req.offset()));
-        return Protocol.emptyResponse(Protocol.OFFSET_COMMIT);
-    }
-
-    private ByteBuffer handleOffsetFetchRequest(Protocol.OffsetFetchRequest req) throws Exception {
-        String data = zkClient.getData(offsetPath(req.group(), req.topic(), req.partition()));
-        return Protocol.encodeOffsetFetchResponse(data == null || data.isBlank() ? -1 : Long.parseLong(data.trim()));
-    }
-
-    private String offsetPath(String group, String topic, int partition) throws KafkaException {
-        if (group == null || !GROUP_NAME.matcher(group).matches() || topic == null || !GROUP_NAME.matcher(topic).matches()) {
-            throw new KafkaException(Errors.INVALID_REQUEST, "Invalid group or topic name");
-        }
-        return "/consumers/" + group + "/offsets/" + topic + "/" + partition;
-    }
-
-    private Partition leaderPartition(String topic, int partitionId) throws KafkaException {
-        Partition partition = partitions.get(new TopicPartition(topic, partitionId));
-        if (partition == null) {
-            Map<Integer, PartitionState> known = clusterMetadata.get(topic);
-            if (known != null && known.containsKey(partitionId)) {
-                throw new KafkaException(Errors.NOT_LEADER, "Broker " + brokerId + " is not the leader for "
-                        + topic + "-" + partitionId);
-            }
-            throw new KafkaException(Errors.UNKNOWN_TOPIC_OR_PARTITION, topic + "-" + partitionId);
-        }
-        if (!partition.isLeader()) {
-            throw new KafkaException(Errors.NOT_LEADER, "Broker " + brokerId + " is not the leader for "
-                    + topic + "-" + partitionId + " (leader is " + partition.leaderId() + ")");
-        }
-        return partition;
-    }
-
-    // ================================================================== utilities
-
-    @FunctionalInterface
-    private interface MetadataTask {
-        void run() throws Exception;
-    }
-
-    private void submit(MetadataTask task) {
-        try {
-            metadataExecutor.submit(() -> {
-                try {
-                    task.run();
-                } catch (Exception e) {
-                    if (isRunning.get()) {
-                        LOG.error("Error processing cluster metadata change", e);
+            pending.add(executor.submit(() -> {
+                try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(follower.getHost(), follower.getPort()))) {
+                    long followerNext = replicate(channel, topic, partition.getId(), offset, message);
+                    while (followerNext <= offset) {
+                        List<byte[]> missing = partition.readMessages(followerNext, MAX_FETCH_BYTES);
+                        if (missing.isEmpty()) {
+                            break;
+                        }
+                        long sendOffset = followerNext;
+                        for (byte[] m : missing) {
+                            followerNext = replicate(channel, topic, partition.getId(), sendOffset++, m);
+                        }
                     }
+                } catch (IOException e) {
+                    LOGGER.warning("Replication of " + topic + "-" + partition.getId() + " to broker " + followerId + " failed: " + e.getMessage());
                 }
-            });
-        } catch (java.util.concurrent.RejectedExecutionException ignored) {
-            // shutting down
+                return null;
+            }));
+        }
+        for (Future<?> f : pending) {
+            try {
+                f.get(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                LOGGER.warning("Timed out waiting for replication of " + topic + "-" + partition.getId());
+            }
         }
     }
 
-    private void runOnMetadataThread(MetadataTask task) throws IOException, InterruptedException {
-        Future<?> f = metadataExecutor.submit(() -> {
-            task.run();
-            return null;
-        });
-        try {
-            f.get();
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw new IOException("Broker initialization failed", e.getCause());
+    /** Returns the follower's next offset after it processed the message. */
+    private long replicate(SocketChannel channel, String topic, int partitionId, long offset, byte[] message) throws IOException {
+        Protocol.send(channel, Protocol.encodeReplicateRequest(topic, partitionId, offset, message));
+        ByteBuffer ack = Protocol.receive(channel);
+        if (ack.get() != Protocol.REPLICATE_ACK) {
+            throw new IOException("Follower rejected replication: " + Protocol.getString(ack));
         }
+        return ack.getLong();
+    }
+
+    /** Follower side: appends the message only if it is the next one this replica expects. */
+    private void handleReplicateRequest(SocketChannel clientChannel, ByteBuffer buffer) throws Exception {
+        String topic = Protocol.getString(buffer);
+        int partitionId = buffer.getInt();
+        long offset = buffer.getLong();
+        byte[] message = new byte[buffer.getInt()];
+        buffer.get(message);
+
+        Map<Integer, Partition> partitions = topics.get(topic);
+        if (partitions == null || !partitions.containsKey(partitionId)) {
+            loadTopic(topic);
+            partitions = topics.get(topic);
+        }
+        if (partitions == null || !partitions.containsKey(partitionId)) {
+            throw new IllegalStateException("Broker " + brokerId + " is not a replica of " + topic + "-" + partitionId);
+        }
+        Partition partition = partitions.get(partitionId);
+        synchronized (partition) {
+            if (offset == partition.getNextOffset()) {
+                partition.append(message);
+            }
+            Protocol.send(clientChannel, Protocol.encodeReplicateAck(partition.getNextOffset()));
+        }
+    }
+
+    private void handleFetchRequest(SocketChannel clientChannel, ByteBuffer buffer) throws Exception {
+        String topic = Protocol.getString(buffer);
+        int partitionId = buffer.getInt();
+        long offset = buffer.getLong();
+        int maxBytes = buffer.getInt();
+
+        Protocol.PartitionMetadata metadata = getPartitionMetadata(topic, partitionId);
+        if (metadata.getLeader() != brokerId) {
+            BrokerInfo leader = clusterMetadata.get(metadata.getLeader());
+            if (leader == null) {
+                throw new IllegalStateException("No leader available for " + topic + "-" + partitionId);
+            }
+            Protocol.send(clientChannel, sendRequest(leader, Protocol.encodeFetchRequest(topic, partitionId, offset, maxBytes)));
+            return;
+        }
+
+        Partition partition = topics.get(topic).get(partitionId);
+        List<byte[]> messages = partition.readMessages(offset, Math.min(maxBytes, MAX_FETCH_BYTES));
+        Protocol.send(clientChannel, Protocol.encodeFetchResponse(offset, messages));
+    }
+
+    private void handleMetadataRequest(SocketChannel clientChannel) throws IOException {
+        List<BrokerInfo> brokers = new ArrayList<>(clusterMetadata.values());
+        brokers.sort((a, b) -> Integer.compare(a.getId(), b.getId()));
+        List<Protocol.TopicMetadata> result = new ArrayList<>();
+        for (Map.Entry<String, Map<Integer, Protocol.PartitionMetadata>> entry : topicMetadata.entrySet()) {
+            List<Protocol.PartitionMetadata> partitions = new ArrayList<>(entry.getValue().values());
+            partitions.sort((a, b) -> Integer.compare(a.getId(), b.getId()));
+            result.add(new Protocol.TopicMetadata(entry.getKey(), partitions));
+        }
+        Protocol.send(clientChannel, Protocol.encodeMetadataResponse(brokers, result));
+    }
+
+    private void handleCreateTopicRequest(SocketChannel clientChannel, ByteBuffer buffer) throws Exception {
+        String topic = Protocol.getString(buffer);
+        int numPartitions = buffer.getInt();
+        short replicationFactor = buffer.getShort();
+
+        if (!isController.get()) {
+            // Only the controller creates topics, so forward the request
+            BrokerInfo controller = clusterMetadata.get(getControllerId());
+            if (controller == null) {
+                throw new IllegalStateException("No controller available");
+            }
+            Protocol.send(clientChannel, sendRequest(controller,
+                    Protocol.encodeCreateTopicRequest(topic, numPartitions, replicationFactor)));
+            return;
+        }
+        createTopic(topic, numPartitions, replicationFactor);
+        Protocol.send(clientChannel, Protocol.encodeCreateTopicResponse());
+    }
+
+    private void handleTopicNotification(SocketChannel clientChannel, ByteBuffer buffer) throws Exception {
+        loadTopic(Protocol.getString(buffer));
+        Protocol.send(clientChannel, Protocol.encodeTopicNotificationAck());
+    }
+
+    // ================================================================ helpers
+
+    private Protocol.PartitionMetadata getPartitionMetadata(String topic, int partitionId) throws Exception {
+        Map<Integer, Protocol.PartitionMetadata> partitions = topicMetadata.get(topic);
+        if (partitions == null) {
+            loadTopic(topic);
+            partitions = topicMetadata.get(topic);
+        }
+        if (partitions == null || !partitions.containsKey(partitionId)) {
+            throw new IllegalArgumentException("Unknown topic or partition: " + topic + "-" + partitionId);
+        }
+        return partitions.get(partitionId);
     }
 
     private static String statePath(String topic, int partition) {
         return "/topics/" + topic + "/partitions/" + partition + "/state";
     }
 
-    private File brokerDataDir() {
-        return new File(config.dataDir, String.valueOf(brokerId));
+    private static String stateJson(int leader, List<Integer> replicas) {
+        return "{\"leader\":" + leader + ",\"replicas\":" + replicas.toString().replace(" ", "") + "}";
     }
 
-    private static ThreadFactory named(String prefix) {
-        AtomicInteger n = new AtomicInteger();
-        return r -> {
-            Thread t = new Thread(r, prefix + "-" + n.incrementAndGet());
-            t.setDaemon(true);
-            return t;
-        };
+    private static int parseLeader(String json) {
+        Matcher m = LEADER.matcher(json);
+        return m.find() ? Integer.parseInt(m.group(1)) : -1;
     }
 
-    private static void closeQuietly(java.io.Closeable c) {
-        try {
-            if (c != null) c.close();
-        } catch (IOException ignored) {
-            // best effort
+    private static List<Integer> parseReplicas(String json) {
+        List<Integer> replicas = new ArrayList<>();
+        Matcher m = REPLICAS.matcher(json);
+        if (m.find()) {
+            for (String s : m.group(1).split(",")) {
+                if (!s.isBlank()) {
+                    replicas.add(Integer.parseInt(s.trim()));
+                }
+            }
         }
+        return replicas;
     }
 
-    private static void awaitQuietly(ExecutorService executor) {
-        try {
-            executor.awaitTermination(5, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+    private static BrokerInfo parseBrokerInfo(int id, String json) {
+        Matcher host = HOST.matcher(json);
+        Matcher port = PORT.matcher(json);
+        if (!host.find() || !port.find()) {
+            throw new IllegalArgumentException("Invalid broker data: " + json);
         }
+        return new BrokerInfo(id, host.group(1), Integer.parseInt(port.group(1)));
     }
 
-    // ================================================================== accessors (used by tests and tools)
+    // ================================================================ accessors
 
     public int getBrokerId() {
         return brokerId;
     }
 
     public int getPort() {
-        return boundPort;
+        return brokerPort;
     }
 
     public boolean isController() {
-        return controller.isActive();
+        return isController.get();
     }
 
     public Partition getPartition(String topic, int partition) {
-        return partitions.get(new TopicPartition(topic, partition));
+        Map<Integer, Partition> partitions = topics.get(topic);
+        return partitions == null ? null : partitions.get(partition);
     }
 
-    // ================================================================== main
+    // ================================================================ main
 
     public static void main(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: TributaryBroker <brokerId> <host> <port> <zkPort|zkHost:zkPort> [dataDir]");
+            System.err.println("Usage: TributaryBroker <brokerId> <host> <port> <zkPort> [dataDir]");
             System.exit(1);
         }
         int brokerId = Integer.parseInt(args[0]);
+        String host = args[1];
+        int port = Integer.parseInt(args[2]);
         String zk = args[3].contains(":") ? args[3] : "localhost:" + args[3];
-        String dataDir = args.length > 4 ? args[4] : "data";
-        TributaryBroker broker = new TributaryBroker(new BrokerConfig(brokerId, args[1], Integer.parseInt(args[2]), zk, dataDir));
-        Runtime.getRuntime().addShutdownHook(new Thread(broker::stop, "shutdown-hook"));
+        String dataDir = args.length > 4 ? args[4] : DATA_DIR;
+
+        TributaryBroker broker = new TributaryBroker(brokerId, host, port, zk, dataDir);
+        Runtime.getRuntime().addShutdownHook(new Thread(broker::stop));
         broker.start();
-        broker.awaitShutdown();
     }
 }

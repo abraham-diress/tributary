@@ -8,7 +8,7 @@
     <artifactId>tributary</artifactId>
     <version>1.0-SNAPSHOT</version>
     <name>Tributary</name>
-    <description>A distributed, replicated commit log inspired by Apache Kafka, built from scratch.</description>
+    <description>A distributed, replicated message log, built from scratch.</description>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
@@ -53,6 +53,9 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
+                <configuration>
+                    <argLine>-Djava.util.logging.config.file=src/test/resources/logging.properties</argLine>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
